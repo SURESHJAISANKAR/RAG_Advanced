@@ -4,7 +4,8 @@ from typing import List, Any, Dict
 import numpy as np
 import faiss
 import pickle
-
+from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -15,6 +16,10 @@ from dotenv import load_dotenv
 # -------------------- ENV --------------------
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+semantic_cache = {}
+bm25 = None
+bm25_corpus = []
 
 # -------------------- DATA LOADER --------------------
 def load_all_docs(data_dir: str) -> List[Any]:
@@ -119,7 +124,7 @@ vector_store = FaissVectorStore()
 INDEX_READY = False
 
 def initialize_system():
-    global INDEX_READY
+    global INDEX_READY, bm25, bm25_corpus
 
     if not INDEX_READY:
         if os.path.exists("faiss_store/index.faiss"):
@@ -132,17 +137,58 @@ def initialize_system():
             embeddings, metadata = pipeline.embed_chunks(chunks)
             vector_store.build(embeddings, metadata)
 
+            bm25_corpus = [m["text"].split() for m in metadata]
+            bm25 = BM25Okapi(bm25_corpus)
+
         INDEX_READY = True
+
+def hybrid_search(query: str, query_embedding):
+
+    # ✅ Vector search
+    vector_results = vector_store.search(query_embedding)
+
+    # ✅ BM25 search
+    tokenized_query = query.split()
+    scores = bm25.get_scores(tokenized_query)
+
+    top_n = np.argsort(scores)[-3:]  # top 3 BM25 results
+
+    bm25_results = [vector_store.metadata[i] for i in top_n]
+
+    # ✅ Combine results
+    combined_results = vector_results + bm25_results
+
+    return combined_results
 
 
 def ask_question(query: str):
     initialize_system()
 
     query_embedding = pipeline.model.encode([query])
-    results = vector_store.search(query_embedding)
+
+    
+    for item in semantic_cache:
+            similarity = cosine_similarity(
+                query_embedding, item["embedding"]
+            )[0][0]
+
+            if similarity > 0.90:   # ✅ similarity threshold
+                print("[SEMANTIC CACHE HIT ✅]")
+                return item["answer"]
+
+    print("[CACHE MISS ❌]")
+
+    # results = vector_store.search(query_embedding)
+    results = hybrid_search(query, query_embedding)
 
     context = "\n".join([r["text"] for r in results])
 
     answer = generate_answer(query, context)
+
+    semantic_cache.append({
+            "query": query,
+            "embedding": query_embedding,
+            "answer": answer
+        })
 
     return answer
