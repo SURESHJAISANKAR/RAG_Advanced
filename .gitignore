@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+env/
+venv/
+
+# Environment variables
+.env
+
+
+# Models
+local_model/
+
+# IDE
+.vscode/
+.idea/
