@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+memory_store = {}
 semantic_cache = {}
 bm25 = None
 bm25_corpus = []
@@ -98,7 +99,7 @@ class FaissVectorStore:
 
 
 # -------------------- LLM --------------------
-def generate_answer(question: str, context: str):
+def generate_answer(question: str, full_prompt: str):
     prompt = f"""
     Answer ONLY from context.
     If not found say "I don't know".
@@ -112,7 +113,7 @@ def generate_answer(question: str, context: str):
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": full_prompt}]
     )
 
     return response.choices[0].message.content
@@ -181,12 +182,12 @@ def hybrid_search(query: str, query_embedding):
     return combined_results
 
 
-def ask_question(query: str):
+def ask_question(query: str, session_id: str):
     initialize_system()
+    history = memory_store.get(session_id, [])
 
     query_embedding = pipeline.model.encode([query])
 
-    
     for item in semantic_cache:
             similarity = cosine_similarity(
                 query_embedding, item["embedding"]
@@ -205,7 +206,28 @@ def ask_question(query: str):
 
     context = "\n".join([r["text"] for r in results])
 
-    answer = generate_answer(query, context)
+    
+    conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
+
+    
+    full_prompt = f"""
+        Use the conversation history and context to answer the question.
+
+        Conversation History:
+        {conversation}
+
+        Context:
+        {context}
+
+        Question:
+        {query}
+        """
+
+
+    answer = generate_answer(query, full_prompt)
+    
+    history.append({"role": "user", "content": query})
+    history.append({"role": "assistant", "content": answer})
 
     semantic_cache.append({
             "query": query,

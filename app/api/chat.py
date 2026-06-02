@@ -6,5 +6,5 @@ router = APIRouter()
 
 @router.post("/chat", response_model=QueryResponse)
 def chat(request: QueryRequest):
-    answer = ask_question(request.query)
+    answer = ask_question(request.query, request.session_id)
     return QueryResponse(response=answer)
