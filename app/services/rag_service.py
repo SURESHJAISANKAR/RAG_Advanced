@@ -9,6 +9,7 @@ from rank_bm25 import BM25Okapi
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder
 
 from groq import Groq
 from dotenv import load_dotenv
@@ -16,7 +17,7 @@ from dotenv import load_dotenv
 # -------------------- ENV --------------------
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 semantic_cache = {}
 bm25 = None
 bm25_corpus = []
@@ -142,6 +143,25 @@ def initialize_system():
 
         INDEX_READY = True
 
+def rerank_results(query: str, results: list, top_k=3):
+
+    # ✅ Prepare (query, doc) pairs
+    pairs = [(query, r["text"]) for r in results]
+
+    # ✅ Get scores
+    scores = reranker.predict(pairs)
+
+    # ✅ Combine results with scores
+    scored_results = list(zip(results, scores))
+
+    # ✅ Sort descending by score
+    scored_results.sort(key=lambda x: x[1], reverse=True)
+
+    # ✅ Take top_k results
+    top_results = [item[0] for item in scored_results[:top_k]]
+
+    return top_results
+
 def hybrid_search(query: str, query_embedding):
 
     # ✅ Vector search
@@ -180,6 +200,8 @@ def ask_question(query: str):
 
     # results = vector_store.search(query_embedding)
     results = hybrid_search(query, query_embedding)
+
+    results = rerank_results(query, results)
 
     context = "\n".join([r["text"] for r in results])
 
