@@ -4,6 +4,8 @@ import json
 import numpy as np
 import faiss
 import pickle
+import uuid
+
 from pathlib import Path
 from typing import List, Any, Dict
 from sklearn.metrics.pairwise import cosine_similarity
@@ -14,6 +16,9 @@ from sentence_transformers import SentenceTransformer
 from sentence_transformers import CrossEncoder
 from groq import Groq
 from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct
+
 
 
 # -------------------- ENV --------------------
@@ -40,6 +45,8 @@ def load_registry(path):
 def save_registry(path, data):
     with open(path, "w") as f:
         json.dump(data, f)
+
+
 
 # -------------------- DATA LOADER --------------------
 def load_all_docs(data_dir: str) -> List[Any]:
@@ -80,6 +87,62 @@ class EmbeddingPipeline:
         return embeddings, metadata
 
 
+# -------------------- QUADRANT VECTOR STORE -----------
+class QdrantVectorStore:
+
+    def __init__(self):
+        self.collection_name = "rag_collection"
+        self.client = QdrantClient(host="localhost", port=6333)
+        self.dim = None
+
+    def _create_collection(self, dim):
+        self.client.recreate_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(
+                size= dim,   # Dimension of your embedding model
+                distance=Distance.COSINE
+            )
+        )
+
+    def add_embeddings(self, embeddings, metadata):
+        
+        points = []
+
+        if self.dim is None:
+            dim = embeddings.shape[1]
+            self._create_collection(dim)
+
+        for i, emb in enumerate(embeddings):
+            points.append(PointStruct(
+                id=str(uuid.uuid4()),
+                vector=emb.tolist(),
+                payload=metadata[i]   # text + source
+            ))
+
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
+        )
+
+    def get_all_metadata(self):
+        points, _ = self.client.scroll(
+        collection_name=self.collection_name,
+        limit=10000
+        )
+
+        return [point.payload for point in points]
+    def search(self, query_embedding, top_k=3):
+
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=query_embedding[0].tolist(),
+            limit=top_k
+        )
+
+        return [r.payload for r in results]
+
+
+
 # -------------------- VECTOR STORE --------------------
 class FaissVectorStore:
     def __init__(self):
@@ -114,7 +177,6 @@ class FaissVectorStore:
 
         # ✅ Append metadata
         self.metadata.extend(metadata)
-
 
 
     def load(self):
@@ -156,19 +218,17 @@ def generate_answer(question: str, full_prompt: str):
 
 # -------------------- MAIN FUNCTION --------------------
 pipeline = EmbeddingPipeline()
-vector_store = FaissVectorStore()
+vector_store = QdrantVectorStore()
 
 INDEX_READY = False
-
 def initialize_system():
     global INDEX_READY, bm25, bm25_corpus
 
     registry_path = "faiss_store/doc_registry.json"
-
     registry = load_registry(registry_path)
 
-
     if not INDEX_READY:
+
         docs_to_process = []
         new_registry = {}
 
@@ -187,27 +247,78 @@ def initialize_system():
                 loader = PyMuPDFLoader(str(pdf))
                 docs_to_process.extend(loader.load())
 
-        if docs_to_process:            
+        # ✅ Only process new/updated docs
+        if docs_to_process:
             chunks = pipeline.chunk_documents(docs_to_process)
             embeddings, metadata = pipeline.embed_chunks(chunks)
 
-            
-            if os.path.exists("faiss_store/index.faiss"):
-                vector_store.load()
-                vector_store.add_embeddings(embeddings, metadata)
-            else:
-                vector_store.build(embeddings, metadata)
-
-            vector_store.save()
+            # ✅ Always upsert to Qdrant (no load/save needed)
+            vector_store.add_embeddings(embeddings, metadata)
 
         else:
             print("[INFO] No new documents to process ✅")
-            vector_store.load()
 
-        bm25_corpus = [m["text"].split() for m in metadata]
+        # ✅ IMPORTANT: Rebuild BM25 from ALL metadata
+        # Need to fetch full metadata from Qdrant or track locally
+        all_metadata = vector_store.get_all_metadata()
+
+        bm25_corpus = [m["text"].split() for m in all_metadata]
         bm25 = BM25Okapi(bm25_corpus)
+
+        # ✅ Save updated registry
         save_registry(registry_path, new_registry)
+
         INDEX_READY = True
+
+# FAISS VECTOR STORE COMMENTED_______
+# def initialize_system():
+#     global INDEX_READY, bm25, bm25_corpus
+
+#     registry_path = "faiss_store/doc_registry.json"
+
+#     registry = load_registry(registry_path)
+
+
+#     if not INDEX_READY:
+#         docs_to_process = []
+#         new_registry = {}
+
+#         directory_path = Path("data").resolve()
+#         pdf_files = list(directory_path.glob("**/*.pdf"))
+
+#         for pdf in pdf_files:
+#             file_hash = get_file_hash(pdf)
+#             file_name = str(pdf)
+
+#             new_registry[file_name] = file_hash
+
+#             # ✅ Check if new or modified
+#             if file_name not in registry or registry[file_name] != file_hash:
+#                 print(f"[INFO] New/Updated file: {file_name}")
+#                 loader = PyMuPDFLoader(str(pdf))
+#                 docs_to_process.extend(loader.load())
+
+#         if docs_to_process:            
+#             chunks = pipeline.chunk_documents(docs_to_process)
+#             embeddings, metadata = pipeline.embed_chunks(chunks)
+
+            
+#             if os.path.exists("faiss_store/index.faiss"):
+#                 vector_store.load()
+#                 vector_store.add_embeddings(embeddings, metadata)
+#             else:
+#                 vector_store.build(embeddings, metadata)
+
+#             vector_store.save()
+
+#         else:
+#             print("[INFO] No new documents to process ✅")
+#             vector_store.load()
+
+#         bm25_corpus = [m["text"].split() for m in metadata]
+#         bm25 = BM25Okapi(bm25_corpus)
+#         save_registry(registry_path, new_registry)
+#         INDEX_READY = True
 
 def rerank_results(query: str, results: list, top_k=3):
 
