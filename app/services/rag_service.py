@@ -100,6 +100,23 @@ class FaissVectorStore:
         with open(f"{self.path}/metadata.pkl", "wb") as f:
             pickle.dump(self.metadata, f)
 
+    
+    def add_embeddings(self, embeddings, metadata):
+        embeddings = embeddings.astype("float32")
+
+        # If index is not initialized
+        if self.index is None:
+            dim = embeddings.shape[1]
+            self.index = faiss.IndexFlatL2(dim)
+
+        # ✅ Add new vectors to existing index
+        self.index.add(embeddings)
+
+        # ✅ Append metadata
+        self.metadata.extend(metadata)
+
+
+
     def load(self):
         self.index = faiss.read_index(f"{self.path}/index.faiss")
 
