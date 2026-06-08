@@ -11,3 +11,6 @@ python-dotenv
 fastembed
 fastapi
 uvicorn
+redis
+ragas
+langchain-google-vertexai

@@ -5,6 +5,8 @@ import numpy as np
 import faiss
 import pickle
 import uuid
+import redis
+import json
 
 from pathlib import Path
 from typing import List, Any, Dict
@@ -25,10 +27,14 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-memory_store = {}
-semantic_cache = {}
+# memory_store = {}
+# semantic_cache = {}
 bm25 = None
 bm25_corpus = []
+
+redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+
 
 #Hashing for Docs
 def get_file_hash(file_path):
@@ -358,21 +364,57 @@ def hybrid_search(query: str, query_embedding):
     return combined_results
 
 
+def summarize_history(history):
+
+    text = "\n".join(
+        [f"{msg['role']}: {msg['content']}" for msg in history]
+    )
+
+    prompt = f"""
+    Summarize this conversation briefly:
+
+    {text}
+    """
+
+    summary = generate_answer("summarize", prompt)
+
+    return [{"role": "system", "content": summary}]
+
+
 def ask_question(query: str, session_id: str):
     initialize_system()
-    history = memory_store.get(session_id, [])
+    # history = memory_store.get(session_id, [])
+    
+    history_data = redis_client.get(f"chat:{session_id}")
+
+    if history_data:
+        history = json.loads(history_data)
+    else:
+        history = []
+
+    
+    if len(history) > 10:
+        history = summarize_history(history)
+    
+    MAX_HISTORY = 8
+    history = history[-MAX_HISTORY:]
 
     query_embedding = pipeline.model.encode([query])
 
-    for item in semantic_cache:
-            similarity = cosine_similarity(
-                query_embedding, item["embedding"]
-            )[0][0]
+    # for item in semantic_cache:
+    #         similarity = cosine_similarity(
+    #             query_embedding, item["embedding"]
+    #         )[0][0]
 
-            if similarity > 0.90:   # ✅ similarity threshold
-                print("[SEMANTIC CACHE HIT ✅]")
-                return item["answer"]
+    #         if similarity > 0.90:   # ✅ similarity threshold
+    #             print("[SEMANTIC CACHE HIT ✅]")
+    #             return item["answer"]
+    cached = redis_client.get(query)
 
+    if cached:
+        print("[REDIS CACHE HIT ✅]")
+        cached_data = json.loads(cached)
+        return cached_data["answer"], cached_data["sources"]
     print("[CACHE MISS ❌]")
 
     # results = vector_store.search(query_embedding)
@@ -408,11 +450,24 @@ def ask_question(query: str, session_id: str):
     history.append({"role": "user", "content": query})
     history.append({"role": "assistant", "content": answer})
 
-    memory_store[session_id] = history
-    semantic_cache.append({
-            "query": query,
-            "embedding": query_embedding,
-            "answer": answer
-        })
+    # memory_store[session_id] = history
+
+    redis_client.set(
+    f"chat:{session_id}",
+    json.dumps(history),
+    ex=3600   # 1 hour expiry (important ✅)
+    )
+    # semantic_cache.append({
+    #         "query": query,
+    #         "embedding": query_embedding,
+    #         "answer": answer
+    #     })
+    redis_client.set(
+    query,
+    json.dumps({
+        "answer": answer,
+        "sources": sources
+    })
+    )
 
     return answer, sources
