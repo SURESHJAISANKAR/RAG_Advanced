@@ -7,6 +7,10 @@ import pickle
 import uuid
 import redis
 import json
+import fitz 
+import pytesseract
+from PIL import Image
+import os
 
 from pathlib import Path
 from typing import List, Any, Dict
@@ -20,6 +24,7 @@ from groq import Groq
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
+from langchain_community.document_loaders import Docx2txtLoader
 
 
 
@@ -63,8 +68,8 @@ def load_all_docs(data_dir: str) -> List[Any]:
     print(f"[INFO] Loaded {len(pdf_files)} PDFs")
 
     for pdf in pdf_files:
-        loader = PyMuPDFLoader(str(pdf))
-        documents.extend(loader.load())
+        # loader = PyMuPDFLoader(str(pdf))
+        documents.extend(load_document_auto(str(pdf)))
 
     return documents
 
@@ -200,6 +205,27 @@ class FaissVectorStore:
 
         return results
 
+def rewrite_query(query: str, history):
+
+    conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
+
+    prompt = f"""
+    Given the conversation and the latest question, rewrite the question 
+    into a clear standalone question.
+
+    Conversation:
+    {conversation}
+
+    Question:
+    {query}
+
+    Rewritten question:
+    """
+
+    rewritten_query = generate_answer(query, prompt)
+
+    return rewritten_query.strip()
+
 
 # -------------------- LLM --------------------
 def generate_answer(question: str, full_prompt: str):
@@ -326,6 +352,8 @@ def initialize_system():
 #         save_registry(registry_path, new_registry)
 #         INDEX_READY = True
 
+
+
 def rerank_results(query: str, results: list, top_k=3):
 
     # ✅ Prepare (query, doc) pairs
@@ -344,6 +372,8 @@ def rerank_results(query: str, results: list, top_k=3):
     top_results = [item[0] for item in scored_results[:top_k]]
 
     return top_results
+
+
 
 def hybrid_search(query: str, query_embedding):
 
@@ -365,22 +395,20 @@ def hybrid_search(query: str, query_embedding):
 
 
 def summarize_history(history):
-
     text = "\n".join(
-        [f"{msg['role']}: {msg['content']}" for msg in history]
-    )
+        [f"{msg['role']}: {msg['content']}" for msg in history])
 
     prompt = f"""
     Summarize this conversation briefly:
 
     {text}
     """
-
     summary = generate_answer("summarize", prompt)
 
     return [{"role": "system", "content": summary}]
 
 
+#---------------- USER QUERY FUNCTION -------------------------------
 def ask_question(query: str, session_id: str):
     initialize_system()
     # history = memory_store.get(session_id, [])
@@ -399,7 +427,13 @@ def ask_question(query: str, session_id: str):
     MAX_HISTORY = 8
     history = history[-MAX_HISTORY:]
 
-    query_embedding = pipeline.model.encode([query])
+    rewritten_query = rewrite_query(query, history)
+
+    print(f"[REWRITTEN QUERY]: {rewritten_query}")
+
+    query_embedding = pipeline.model.encode([rewritten_query])
+    # ✅ Query Rewriting
+
 
     # for item in semantic_cache:
     #         similarity = cosine_similarity(
@@ -418,15 +452,15 @@ def ask_question(query: str, session_id: str):
     print("[CACHE MISS ❌]")
 
     # results = vector_store.search(query_embedding)
-    results = hybrid_search(query, query_embedding)
+    # results = hybrid_search(query, query_embedding)
+    # results = rerank_results(query, results)
 
-    results = rerank_results(query, results)
+    results = hybrid_search(rewritten_query, query_embedding)
+    results = rerank_results(rewritten_query, results)
 
     context = "\n".join([r["text"] for r in results])
-
     
     conversation = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
-
     
     full_prompt = f"""
         Use the conversation history and context to answer the question.
@@ -471,3 +505,77 @@ def ask_question(query: str, session_id: str):
     )
 
     return answer, sources
+
+
+# ✅ OCR for images
+def extract_text_from_image(image_path):
+    image = Image.open(image_path)
+    return pytesseract.image_to_string(image)
+
+
+# ✅ PDF with image handling
+def ingest_pdf_with_images(pdf_path):
+    documents = []
+
+    # ✅ Extract text normally
+    loader = PyMuPDFLoader(pdf_path)
+    documents.extend(loader.load())
+
+    # ✅ Extract images + OCR
+    doc = fitz.open(pdf_path)
+
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        image_list = page.get_images(full=True)
+
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+
+            image_bytes = base_image["image"]
+
+            image_path = f"temp_{page_index}_{img_index}.png"
+
+            with open(image_path, "wb") as f:
+                f.write(image_bytes)
+
+            text = pytesseract.image_to_string(Image.open(image_path))
+
+            if text.strip():
+                documents.append({
+                    "page_content": text,
+                    "metadata": {"source": pdf_path}
+                })
+            os.remove(image_path)     
+    return documents
+
+
+# ✅ AUTO LOADER (VERY IMPORTANT)
+def load_document_auto(file_path):
+
+    ext = file_path.split(".")[-1].lower()
+
+    if ext == "pdf":
+        return ingest_pdf_with_images(file_path)
+
+    elif ext == "txt":
+        with open(file_path, "r") as f:
+            return [{
+                "page_content": f.read(),
+                "metadata": {"source": file_path}
+            }]
+
+    elif ext == "docx":
+        
+        loader = Docx2txtLoader(file_path)
+        return loader.load()
+
+    elif ext in ["png", "jpg", "jpeg"]:
+        text = extract_text_from_image(file_path)
+        return [{
+            "page_content": text,
+            "metadata": {"source": file_path}
+        }]
+
+    else:
+        raise ValueError("Unsupported file type")
