@@ -15,3 +15,7 @@ redis
 ragas
 langchain-google-vertexai
 pytesseract
+quadrant-client
+pillow
+rank-bm25
+scikit-learn
